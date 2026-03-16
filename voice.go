@@ -518,7 +518,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			}
 
 			// Pass received message to voice event handler
-			go v.onEvent(ctx, messageType == websocket.BinaryMessage, message)
+			v.onEvent(ctx, messageType == websocket.BinaryMessage, message)
 		}
 	}
 
@@ -954,8 +954,10 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		}
 
 		v.Cond.L.Lock()
+		daveActive := v.dave != nil && v.dave.CanEncrypt()
 		speaking := v.speaking
 		v.Cond.L.Unlock()
+
 		if !speaking {
 			err := v.Speaking(true)
 			if err != nil {
@@ -967,9 +969,6 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
 		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
 
-		v.Cond.L.Lock()
-		daveActive := v.dave != nil && v.dave.IsActive()
-		v.Cond.L.Unlock()
 		if daveActive {
 			encrypted, err := v.dave.EncryptFrame(recvbuf)
 			if err != nil {
@@ -1276,6 +1275,22 @@ func (v *VoiceConnection) handleDAVEPrepareEpoch(ctx context.Context, data json.
 		return
 	}
 
+	v.sendDAVEKeyPackageBinary(kpData)
+}
+
+func (v *VoiceConnection) RekeyDAVE() {
+	v.Cond.L.Lock()
+	dave := v.dave
+	v.Cond.L.Unlock()
+	if dave == nil {
+		return
+	}
+
+	kpData, err := dave.ResetForReWelcome()
+	if err != nil {
+		v.log(LogError, "DAVE rekey failed: %s", err)
+		return
+	}
 	v.sendDAVEKeyPackageBinary(kpData)
 }
 
