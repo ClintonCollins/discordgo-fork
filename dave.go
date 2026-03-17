@@ -1,6 +1,7 @@
 package discordgo
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
@@ -9,6 +10,17 @@ import (
 
 	"github.com/bwmarrin/discordgo/mls"
 )
+
+var opusSilencePacket = [3]byte{0xF8, 0xFF, 0xFE}
+
+type daveReceiver struct {
+	userID            string
+	baseSecret        []byte
+	currentGeneration uint32
+	key               []byte
+	aesBlock          cipher.Block
+	frameCipher       cipher.AEAD
+}
 
 type DAVESession struct {
 	mu                  sync.Mutex
@@ -26,6 +38,9 @@ type DAVESession struct {
 	ratchetBaseSecret []byte
 	currentGeneration uint32
 	hasPendingKey     bool
+
+	ssrcToUserID map[uint32]string
+	receivers    map[uint32]*daveReceiver
 
 	kpBundle *mls.KeyPackageBundle
 }
@@ -90,6 +105,7 @@ func (d *DAVESession) HandleWelcome(data []byte) error {
 	d.exporterSecret = result.ExporterSecret
 	d.epoch = result.Epoch
 	d.hasPendingKey = true
+	d.receivers = nil
 	return nil
 }
 
@@ -158,6 +174,7 @@ func (d *DAVESession) HandlePrepareEpoch(epoch uint64, protocolVersion int) ([]b
 	d.senderKey = nil
 	d.frameCipher = nil
 	d.exporterSecret = nil
+	d.receivers = nil
 
 	return d.generateKeyPackageLocked()
 }
@@ -232,10 +249,115 @@ func (d *DAVESession) EncryptFrame(opusData []byte) ([]byte, error) {
 	return encrypted, nil
 }
 
-func (d *DAVESession) IsActive() bool {
+func (d *DAVESession) SetSSRC(ssrc uint32, userID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.active
+	if d.ssrcToUserID == nil {
+		d.ssrcToUserID = make(map[uint32]string)
+	}
+	d.ssrcToUserID[ssrc] = userID
+}
+
+func (d *DAVESession) DecryptFrame(ssrc uint32, data []byte) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(data) == 3 && data[0] == opusSilencePacket[0] && data[1] == opusSilencePacket[1] && data[2] == opusSilencePacket[2] {
+		return data, nil
+	}
+
+	ciphertext, truncatedTag, nonce, err := parseSecureFrame(data)
+	if err == errNotDAVEFrame {
+		return data, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	recv := d.receivers[ssrc]
+	if recv == nil {
+		userID, ok := d.ssrcToUserID[ssrc]
+		if !ok {
+			return nil, fmt.Errorf("unknown SSRC %d", ssrc)
+		}
+		recv, err = d.createReceiverLocked(ssrc, userID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	generation := nonce >> 24
+	if generation != recv.currentGeneration {
+		key, err := hashRatchetGetKey(recv.baseSecret, generation)
+		if err != nil {
+			return nil, fmt.Errorf("ratcheting receiver key for generation %d: %w", generation, err)
+		}
+		recv.key = key
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		recv.aesBlock = block
+		fc, err := newDAVECipher(key)
+		if err != nil {
+			return nil, err
+		}
+		recv.frameCipher = fc
+		recv.currentGeneration = generation
+	}
+
+	return decryptSecureFrame(recv.aesBlock, recv.frameCipher, nonce, ciphertext, truncatedTag)
+}
+
+func (d *DAVESession) createReceiverLocked(ssrc uint32, userID string) (*daveReceiver, error) {
+	if d.exporterSecret == nil {
+		return nil, fmt.Errorf("no exporter secret")
+	}
+
+	userIDNum, err := strconv.ParseUint(userID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parsing user ID: %w", err)
+	}
+	context := make([]byte, 8)
+	binary.LittleEndian.PutUint64(context, userIDNum)
+
+	baseSecret, err := mls.Export(d.exporterSecret, daveExportLabel, context, daveKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("exporting receiver base secret: %w", err)
+	}
+
+	key, err := hashRatchetGetKey(baseSecret, 0)
+	if err != nil {
+		return nil, fmt.Errorf("deriving receiver ratchet key: %w", err)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	fc, err := newDAVECipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	recv := &daveReceiver{
+		userID:     userID,
+		baseSecret: baseSecret,
+		key:        key,
+		aesBlock:   block,
+		frameCipher: fc,
+	}
+
+	if d.receivers == nil {
+		d.receivers = make(map[uint32]*daveReceiver)
+	}
+	d.receivers[ssrc] = recv
+	return recv, nil
+}
+
+func (d *DAVESession) clearReceiversLocked() {
+	d.receivers = nil
 }
 
 func (d *DAVESession) CanEncrypt() bool {
@@ -259,4 +381,6 @@ func (d *DAVESession) Reset() {
 	d.ratchetBaseSecret = nil
 	d.currentGeneration = 0
 	d.hasPendingKey = false
+	d.ssrcToUserID = nil
+	d.clearReceiversLocked()
 }
