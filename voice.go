@@ -93,6 +93,8 @@ type VoiceConnection struct {
 
 	dave *DAVESession
 
+	ssrcToUserID map[uint32]string
+
 	pendingReWelcome bool
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
@@ -624,6 +626,9 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			v.log(LogInformational, "DAVE protocol version %d", op4.DAVEProtocolVersion)
 			if op4.DAVEProtocolVersion > 0 {
 				v.dave = NewDAVESession(v.session.State.User.ID)
+				for ssrc, userID := range v.ssrcToUserID {
+					v.dave.SetSSRC(ssrc, userID)
+				}
 
 				var err error
 				daveKPData, err = v.dave.GenerateKeyPackage()
@@ -656,14 +661,21 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			return
 
 		case 5:
-			if len(v.voiceSpeakingUpdateHandlers) == 0 {
-				return
-			}
-
 			voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 			if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 				v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 				return
+			}
+
+			v.Cond.L.Lock()
+			if v.ssrcToUserID == nil {
+				v.ssrcToUserID = make(map[uint32]string)
+			}
+			v.ssrcToUserID[uint32(voiceSpeakingUpdate.SSRC)] = voiceSpeakingUpdate.UserID
+			dave := v.dave
+			v.Cond.L.Unlock()
+			if dave != nil {
+				dave.SetSSRC(uint32(voiceSpeakingUpdate.SSRC), voiceSpeakingUpdate.UserID)
 			}
 
 			for _, h := range v.voiceSpeakingUpdateHandlers {
@@ -673,6 +685,29 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 		case 6: // HEARTBEAT response
 			// add code to use this to track latency?
 			v.log(LogDebug, "recieved heartbeat ACK")
+			return
+
+		case 12: // CLIENT CONNECT
+			var op12 struct {
+				UserID    string `json:"user_id"`
+				AudioSSRC uint32 `json:"audio_ssrc"`
+			}
+			if err := json.Unmarshal(e.RawData, &op12); err != nil {
+				v.log(LogError, "OP12 unmarshal error, %s, %s", err, string(e.RawData))
+				return
+			}
+			if op12.AudioSSRC != 0 {
+				v.Cond.L.Lock()
+				if v.ssrcToUserID == nil {
+					v.ssrcToUserID = make(map[uint32]string)
+				}
+				v.ssrcToUserID[op12.AudioSSRC] = op12.UserID
+				dave := v.dave
+				v.Cond.L.Unlock()
+				if dave != nil {
+					dave.SetSSRC(op12.AudioSSRC, op12.UserID)
+				}
+			}
 			return
 
 		case 8: // HELLO
@@ -1097,6 +1132,18 @@ func (v *VoiceConnection) opusReceiver(ctx context.Context) {
 			p.Opus = p.Opus[int(extensionLength)*4:]
 		}
 
+		v.Cond.L.Lock()
+		dave := v.dave
+		v.Cond.L.Unlock()
+		if dave != nil {
+			decrypted, err := dave.DecryptFrame(p.SSRC, p.Opus)
+			if err != nil {
+				v.log(LogDebug, "DAVE decrypt error for SSRC %d: %s", p.SSRC, err)
+				continue
+			}
+			p.Opus = decrypted
+		}
+
 		if ch != nil {
 			select {
 			case ch <- &p:
@@ -1237,7 +1284,7 @@ func (v *VoiceConnection) handleDAVEExecuteTransition(data json.RawMessage) {
 			v.log(LogError, "DAVE execute_transition failed: %s", err)
 			return
 		}
-		v.log(LogInformational, "DAVE execute_transition id=%d active=%v", msg.TransitionID, dave.IsActive())
+		v.log(LogInformational, "DAVE execute_transition id=%d canEncrypt=%v", msg.TransitionID, dave.CanEncrypt())
 
 		v.Cond.L.Lock()
 		pending := v.pendingReWelcome
