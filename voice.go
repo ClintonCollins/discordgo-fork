@@ -650,7 +650,16 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				go v.opusReceiver(ctx)
 			}
 
-			v.Status = VoiceConnectionStatusReady
+			// Only signal Ready immediately if DAVE is not in use.
+			// When DAVE is negotiated, Ready is deferred until the DAVE
+			// handshake completes (execute_transition with canEncrypt=true)
+			// so that ChannelVoiceJoin blocks until audio can be properly
+			// encrypted. Without this, the bot sends non-DAVE frames that
+			// Discord rejects after ~4 seconds, causing an infinite
+			// reconnect loop.
+			if daveKPData == nil {
+				v.Status = VoiceConnectionStatusReady
+			}
 
 			v.Cond.Broadcast()
 			v.Cond.L.Unlock()
@@ -878,6 +887,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	for i := 8; i < len(rb)-2; i++ {
 		if rb[i] == 0 {
 			ip = string(rb[8:i])
+			break
 		}
 	}
 
@@ -989,9 +999,19 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		}
 
 		v.Cond.L.Lock()
-		daveActive := v.dave != nil && v.dave.CanEncrypt()
+		daveExpected := v.dave != nil
+		daveActive := daveExpected && v.dave.CanEncrypt()
 		speaking := v.speaking
 		v.Cond.L.Unlock()
+
+		// If DAVE encryption is negotiated but not yet ready (e.g.,
+		// handshake in progress or re-keying), drop the frame rather
+		// than sending it with only basic RTP encryption. Discord
+		// rejects non-DAVE audio when DAVE is active and will
+		// disconnect the bot after ~4 seconds of invalid frames.
+		if daveExpected && !daveActive {
+			continue
+		}
 
 		if !speaking {
 			err := v.Speaking(true)
@@ -1285,6 +1305,19 @@ func (v *VoiceConnection) handleDAVEExecuteTransition(data json.RawMessage) {
 			return
 		}
 		v.log(LogInformational, "DAVE execute_transition id=%d canEncrypt=%v", msg.TransitionID, dave.CanEncrypt())
+
+		// Signal Ready now that DAVE encryption is established.
+		// This unblocks ChannelVoiceJoin which waits for Ready,
+		// ensuring no audio is sent before DAVE can encrypt it.
+		if dave.CanEncrypt() {
+			v.Cond.L.Lock()
+			if v.Status != VoiceConnectionStatusReady {
+				v.log(LogInformational, "DAVE handshake complete, voice connection ready")
+				v.Status = VoiceConnectionStatusReady
+				v.Cond.Broadcast()
+			}
+			v.Cond.L.Unlock()
+		}
 
 		v.Cond.L.Lock()
 		pending := v.pendingReWelcome
