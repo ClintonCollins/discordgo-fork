@@ -147,6 +147,12 @@ func (d *DAVESession) HandleExecuteTransition(transitionID uint16) error {
 		}
 
 		if !derivedNewKey && !d.hasPendingKey {
+			// If the session was already activated (e.g., by the
+			// Welcome handler calling Activate()), don't clear it.
+			// A late execute_transition should be a no-op in this case.
+			if d.active {
+				return nil
+			}
 			d.active = false
 			d.senderKey = nil
 			d.frameCipher = nil
@@ -342,10 +348,10 @@ func (d *DAVESession) createReceiverLocked(ssrc uint32, userID string) (*daveRec
 	}
 
 	recv := &daveReceiver{
-		userID:     userID,
-		baseSecret: baseSecret,
-		key:        key,
-		aesBlock:   block,
+		userID:      userID,
+		baseSecret:  baseSecret,
+		key:         key,
+		aesBlock:    block,
 		frameCipher: fc,
 	}
 
@@ -358,6 +364,20 @@ func (d *DAVESession) createReceiverLocked(ssrc uint32, userID string) (*daveRec
 
 func (d *DAVESession) clearReceiversLocked() {
 	d.receivers = nil
+}
+
+// Activate marks the session as active so that CanEncrypt returns true.
+// This is called after the Welcome handler derives the sender key, so
+// that audio can be encrypted immediately without waiting for
+// execute_transition — which Discord does not always send (e.g., after
+// server migration with existing channel members).
+func (d *DAVESession) Activate() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.frameCipher != nil {
+		d.active = true
+		d.hasPendingKey = false
+	}
 }
 
 func (d *DAVESession) CanEncrypt() bool {

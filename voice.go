@@ -1258,7 +1258,21 @@ func (v *VoiceConnection) handleDAVEBinary(message []byte) {
 		}
 
 		dave.HandlePrepareTransition(transitionID, 1)
+		dave.Activate()
 		v.log(LogInformational, "DAVE encryption prepared after Welcome")
+
+		// Signal Ready now that DAVE encryption is established.
+		// We activate from the Welcome handler rather than waiting
+		// for execute_transition because Discord does not always
+		// send execute_transition (e.g., after server migration
+		// with other users already in the channel).
+		v.Cond.L.Lock()
+		if v.Status != VoiceConnectionStatusReady {
+			v.log(LogInformational, "DAVE handshake complete, voice connection ready")
+			v.Status = VoiceConnectionStatusReady
+			v.Cond.Broadcast()
+		}
+		v.Cond.L.Unlock()
 
 		v.sendDAVEReadyForTransition(transitionID)
 
