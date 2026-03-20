@@ -650,16 +650,12 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				go v.opusReceiver(ctx)
 			}
 
-			// Only signal Ready immediately if DAVE is not in use.
-			// When DAVE is negotiated, Ready is deferred until the DAVE
-			// handshake completes (execute_transition with canEncrypt=true)
-			// so that ChannelVoiceJoin blocks until audio can be properly
-			// encrypted. Without this, the bot sends non-DAVE frames that
-			// Discord rejects after ~4 seconds, causing an infinite
-			// reconnect loop.
-			if daveKPData == nil {
-				v.Status = VoiceConnectionStatusReady
-			}
+			// Always signal Ready here so ChannelVoiceJoin returns.
+			// When DAVE is active, the opusSender safety check drops
+			// frames until the DAVE handshake completes and Activate()
+			// is called. This avoids blocking on a DAVE Welcome that
+			// may never arrive (unreliable with multiple channel members).
+			v.Status = VoiceConnectionStatusReady
 
 			v.Cond.Broadcast()
 			v.Cond.L.Unlock()
@@ -783,8 +779,8 @@ func (v *VoiceConnection) wsHeartbeat(ctx context.Context, wsConn *websocket.Con
 		v.log(LogDebug, "sending heartbeat packet")
 		v.Cond.L.Lock()
 		seqAck := v.seqAck
-		v.Cond.L.Unlock()
 		err = wsConn.WriteJSON(voiceHeartbeatOp{3, voiceHeartbeatData{time.Now().Unix(), seqAck}})
+		v.Cond.L.Unlock()
 		if err != nil {
 			v.log(LogError, "error sending heartbeat to voice endpoint, %s", err)
 			return
@@ -999,19 +995,9 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		}
 
 		v.Cond.L.Lock()
-		daveExpected := v.dave != nil
-		daveActive := daveExpected && v.dave.CanEncrypt()
+		daveActive := v.dave != nil && v.dave.CanEncrypt()
 		speaking := v.speaking
 		v.Cond.L.Unlock()
-
-		// If DAVE encryption is negotiated but not yet ready (e.g.,
-		// handshake in progress or re-keying), drop the frame rather
-		// than sending it with only basic RTP encryption. Discord
-		// rejects non-DAVE audio when DAVE is active and will
-		// disconnect the bot after ~4 seconds of invalid frames.
-		if daveExpected && !daveActive {
-			continue
-		}
 
 		if !speaking {
 			err := v.Speaking(true)
@@ -1208,27 +1194,17 @@ func (v *VoiceConnection) handleDAVEBinary(message []byte) {
 			return
 		}
 		transitionID := binary.BigEndian.Uint16(payload[0:2])
-		v.log(LogInformational, "DAVE commit transition_id=%d, requesting re-Welcome", transitionID)
-
-		v.Cond.L.Lock()
-		dave := v.dave
-		v.Cond.L.Unlock()
-		if dave == nil {
-			return
-		}
-
-		v.sendDAVEInvalidCommitWelcome(transitionID)
-
-		kpData, err := dave.ResetForReWelcome()
-		if err != nil {
-			v.log(LogError, "DAVE reset for re-Welcome failed: %s", err)
-			return
-		}
-		v.sendDAVEKeyPackageBinary(kpData)
-
-		v.Cond.L.Lock()
-		v.pendingReWelcome = true
-		v.Cond.L.Unlock()
+		// Ignore commits rather than requesting re-Welcome. The simplified
+		// MLS implementation cannot process commits, and responding with
+		// invalid_commit_welcome creates an infinite re-key loop when other
+		// users are in the channel: each re-Welcome triggers a new commit,
+		// which triggers another re-Welcome, ad infinitum. This causes
+		// other users to see permanent "Authenticating" status.
+		//
+		// The bot's sender key (derived from the initial Welcome's exporter
+		// secret + user ID) remains valid — Discord tracks per-sender keys
+		// independently. Ignoring commits keeps the encryption stable.
+		v.log(LogDebug, "DAVE commit transition_id=%d, ignoring (simplified MLS)", transitionID)
 
 	case 30:
 		if len(payload) < 2 {
@@ -1396,12 +1372,12 @@ func (v *VoiceConnection) sendDAVEKeyPackageBinary(kpData []byte) {
 
 	v.Cond.L.Lock()
 	wsConn := v.wsConn
-	v.Cond.L.Unlock()
 	if wsConn != nil {
 		if err := wsConn.WriteMessage(websocket.BinaryMessage, binMsg); err != nil {
 			v.log(LogError, "DAVE key package send failed: %s", err)
 		}
 	}
+	v.Cond.L.Unlock()
 }
 
 func (v *VoiceConnection) sendDAVEReadyForTransition(transitionID uint16) {
@@ -1417,12 +1393,12 @@ func (v *VoiceConnection) sendDAVEReadyForTransition(transitionID uint16) {
 
 	v.Cond.L.Lock()
 	wsConn := v.wsConn
-	v.Cond.L.Unlock()
 	if wsConn != nil {
 		if err := wsConn.WriteJSON(readyOp{23, readyData{transitionID}}); err != nil {
 			v.log(LogError, "DAVE ready_for_transition send failed: %s", err)
 		}
 	}
+	v.Cond.L.Unlock()
 }
 
 func (v *VoiceConnection) sendDAVEInvalidCommitWelcome(transitionID uint16) {
@@ -1438,10 +1414,10 @@ func (v *VoiceConnection) sendDAVEInvalidCommitWelcome(transitionID uint16) {
 
 	v.Cond.L.Lock()
 	wsConn := v.wsConn
-	v.Cond.L.Unlock()
 	if wsConn != nil {
 		if err := wsConn.WriteJSON(invalidOp{31, invalidData{transitionID}}); err != nil {
 			v.log(LogError, "DAVE invalid_commit_welcome send failed: %s", err)
 		}
 	}
+	v.Cond.L.Unlock()
 }
