@@ -75,6 +75,8 @@ type VoiceConnection struct {
 
 	// can be nil, use only for send message
 	// mostly this is available connection or nil, but rarely closed connection
+	// All reads and writes to wsConn must hold Cond.L to serialize access.
+	// gorilla/websocket is not safe for concurrent writes.
 	wsConn *websocket.Conn
 
 	// calling this may close websocket and all related connection.
@@ -995,9 +997,24 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		}
 
 		v.Cond.L.Lock()
-		daveActive := v.dave != nil && v.dave.CanEncrypt()
+		hasDave := v.dave != nil
+		daveActive := hasDave && v.dave.CanEncrypt()
 		speaking := v.speaking
 		v.Cond.L.Unlock()
+
+		// Drop frames while DAVE is configured but the handshake hasn't completed.
+		// Discord rejects non-DAVE-encrypted frames on DAVE-enabled channels,
+		// so sending them just wastes sequence numbers.
+		// Still wait on the ticker to maintain 20ms frame pacing — without it,
+		// the loop drains the entire OpusSend buffer in milliseconds.
+		if hasDave && !daveActive {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			continue
+		}
 
 		if !speaking {
 			err := v.Speaking(true)
