@@ -642,6 +642,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			if v.OpusSend == nil {
 				v.OpusSend = make(chan []byte, 16)
 			}
+			v.log(LogInformational, "launching opusSender (OP4 SessionDescription)")
 			go v.opusSender(ctx, 48000, 960)
 
 			if !v.deaf {
@@ -961,7 +962,8 @@ func (v *VoiceConnection) udpKeepAlive(ctx context.Context, udpConn *net.UDPConn
 // pre-encoded opus audio to Discord.  Supposedly.
 func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 
-	v.log(LogInformational, "called")
+	v.log(LogInformational, "opusSender started")
+	defer v.log(LogInformational, "opusSender exited")
 
 	v.Cond.L.Lock()
 	udpConn := v.udpConn
@@ -983,6 +985,9 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 	// start a send loop that loops until buf chan is closed
 	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
 	defer ticker.Stop()
+	var daveDropStart time.Time
+	var daveDropLogged bool
+	firstFrameSent := false
 	for i := uint32(0); true; i++ {
 
 		// Get data from chan.  If chan is closed, return.
@@ -1008,12 +1013,26 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 		// Still wait on the ticker to maintain 20ms frame pacing — without it,
 		// the loop drains the entire OpusSend buffer in milliseconds.
 		if hasDave && !daveActive {
+			if daveDropStart.IsZero() {
+				daveDropStart = time.Now()
+			}
+			if !daveDropLogged {
+				v.log(LogWarning, "DAVE active but handshake incomplete — dropping audio frames")
+				daveDropLogged = true
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
 			continue
+		}
+
+		// If we were dropping frames and DAVE just became active, log the recovery.
+		if daveDropLogged {
+			v.log(LogWarning, "DAVE handshake completed after %s — audio frames flowing", time.Since(daveDropStart).Round(time.Millisecond))
+			daveDropStart = time.Time{}
+			daveDropLogged = false
 		}
 
 		if !speaking {
@@ -1058,6 +1077,11 @@ func (v *VoiceConnection) opusSender(ctx context.Context, rate, size int) {
 			err := fmt.Errorf("udp write error, %w", err)
 			v.failure(err)
 			return
+		}
+
+		if !firstFrameSent {
+			v.log(LogInformational, "first audio frame sent to Discord via UDP")
+			firstFrameSent = true
 		}
 
 		// don't care if it overflows because it is already defined in Go spec
