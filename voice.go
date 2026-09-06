@@ -787,7 +787,10 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				return
 			}
 			// Start the voice websocket heartbeat to keep the connection alive
-			go v.wsHeartbeat(ctx, v.wsConn, op8.HeartbeatInterval)
+			v.Cond.L.Lock()
+			wsConn := v.wsConn
+			v.Cond.L.Unlock()
+			go v.wsHeartbeat(ctx, wsConn, op8.HeartbeatInterval)
 
 		case 9: // resumed
 			v.log(LogInformational, "resumed voice websocket")
@@ -891,6 +894,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	host := v.op2.IP + ":" + strconv.Itoa(v.op2.Port)
 	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
+		v.Cond.L.Unlock()
 		v.log(LogWarning, "error resolving udp host %s, %s", host, err)
 		return
 	}
@@ -898,6 +902,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	v.log(LogInformational, "connecting to udp addr %s", addr.String())
 	udpConn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
+		v.Cond.L.Unlock()
 		v.log(LogWarning, "error connecting to udp addr %s, %s", addr.String(), err)
 		return
 	}
@@ -921,7 +926,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	binary.BigEndian.PutUint32(sb[4:], v.op2.SSRC) // The SSRC code from the Op 2 VoiceConnection event
 
 	// And send that data over the UDP connection to Discord.
-	_, err = v.udpConn.Write(sb)
+	_, err = udpConn.Write(sb)
 	if err != nil {
 		v.log(LogWarning, "udp write error to %s, %s", addr.String(), err)
 		return
@@ -932,7 +937,7 @@ func (v *VoiceConnection) udpOpen(ctx context.Context) (err error) {
 	// of the response.  This should be our public IP and PORT as Discord
 	// saw us.
 	rb := make([]byte, 74)
-	rlen, _, err := v.udpConn.ReadFromUDP(rb)
+	rlen, _, err := udpConn.ReadFromUDP(rb)
 	if err != nil {
 		v.log(LogWarning, "udp read error, %s, %s", addr.String(), err)
 		return
@@ -985,7 +990,7 @@ encryptionModeLoop:
 	}
 
 	// start udpKeepAlive
-	go v.udpKeepAlive(ctx, v.udpConn, 5*time.Second)
+	go v.udpKeepAlive(ctx, udpConn, 5*time.Second)
 	// TODO: find a way to check that it fired off okay
 
 	return
