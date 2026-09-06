@@ -234,6 +234,17 @@ func (v *VoiceConnection) Kill() {
 	v.log(LogInformational, "done")
 }
 
+func (v *VoiceConnection) GetSSRCMap() map[uint32]string {
+	v.Cond.L.Lock()
+	defer v.Cond.L.Unlock()
+
+	ssrcToUserID := make(map[uint32]string, len(v.ssrcToUserID))
+	for ssrc, userID := range v.ssrcToUserID {
+		ssrcToUserID[ssrc] = userID
+	}
+	return ssrcToUserID
+}
+
 // AddHandler adds a Handler for VoiceSpeakingUpdate events.
 func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 	v.Cond.L.Lock()
@@ -754,9 +765,15 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 				}
 				v.ssrcToUserID[op12.AudioSSRC] = op12.UserID
 				dave := v.dave
+				handlers := v.voiceSpeakingUpdateHandlers
 				v.Cond.L.Unlock()
 				if dave != nil {
 					dave.SetSSRC(op12.AudioSSRC, op12.UserID)
+				}
+
+				voiceSpeakingUpdate := &VoiceSpeakingUpdate{UserID: op12.UserID, SSRC: int(op12.AudioSSRC)}
+				for _, h := range handlers {
+					h(v, voiceSpeakingUpdate)
 				}
 			}
 			return
