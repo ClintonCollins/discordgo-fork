@@ -13,10 +13,10 @@ import (
 var errNotDAVEFrame = fmt.Errorf("not a DAVE frame")
 
 const (
-	daveTagSize                = 8
-	daveKeySize                = 16
-	daveExportLabel            = "Discord Secure Frames v0"
-	minSupplementalBytesSize   = daveTagSize + 1 + 1 + 2 // tag + nonce(min 1) + sizeB + magic = 12
+	daveTagSize              = 8
+	daveKeySize              = 16
+	daveExportLabel          = "Discord Secure Frames v0"
+	minSupplementalBytesSize = daveTagSize + 1 + 1 + 2 // tag + nonce(min 1) + sizeB + magic = 12
 )
 
 func encryptSecureFrame(frameCipher cipher.AEAD, nonce uint32, opusData []byte) []byte {

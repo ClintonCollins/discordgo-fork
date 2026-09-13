@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	version10               uint16 = 1
-	cipherSuiteID           uint16 = 2
+	version10                uint16 = 1
+	cipherSuiteID            uint16 = 2
 	leafNodeSourceKeyPackage uint8  = 1
 	credentialTypeBasic      uint8  = 1
 )
