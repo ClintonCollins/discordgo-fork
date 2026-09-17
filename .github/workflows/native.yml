@@ -1,0 +1,49 @@
+name: Native DAVE libraries
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-24.04
+          - platform: windows
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Cache native dependencies
+        uses: actions/cache@v4
+        with:
+          path: .native/libdave/.cache
+          key: libdave-${{ runner.os }}-${{ hashFiles('scripts/prepare-libdave.*', 'scripts/libdave-channel-binding.patch') }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake nasm pkg-config curl zip unzip
+      - name: Build Linux library
+        if: runner.os == 'Linux'
+        run: bash scripts/prepare-libdave.sh linux
+      - name: Build Windows library
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-libdave.ps1
+      - name: Upload native library
+        uses: actions/upload-artifact@v6
+        with:
+          name: libdave-${{ matrix.platform }}
+          path: .native/libdave/${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,47 @@
+diff --git a/cpp/includes/dave/dave.h b/cpp/includes/dave/dave.h
+index 8c52ab1..6455741 100644
+--- a/cpp/includes/dave/dave.h
++++ b/cpp/includes/dave/dave.h
+@@ -169,6 +169,9 @@ typedef struct DAVEDecryptorStats {
+  */
+ DAVE_EXPORT uint16_t daveMaxSupportedProtocolVersion(void);
+ 
++/** @brief Reports enforcement of the expected voice channel in MLS Welcomes. */
++DAVE_EXPORT bool daveHasWelcomeChannelBinding(void);
++
+ /*******************************************************************************
+  * Memory Management
+  ******************************************************************************/
+diff --git a/cpp/src/bindings_capi.cpp b/cpp/src/bindings_capi.cpp
+index 15c8b14..611edef 100644
+--- a/cpp/src/bindings_capi.cpp
++++ b/cpp/src/bindings_capi.cpp
+@@ -81,6 +81,11 @@ uint16_t daveMaxSupportedProtocolVersion(void)
+     return discord::dave::MaxSupportedProtocolVersion();
+ }
+ 
++bool daveHasWelcomeChannelBinding(void)
++{
++    return true;
++}
++
+ void daveFree(void* ptr)
+ {
+     free(ptr);
+diff --git a/cpp/src/mls/session.cpp b/cpp/src/mls/session.cpp
+index 4bcd415..885bd8a 100644
+--- a/cpp/src/mls/session.cpp
++++ b/cpp/src/mls/session.cpp
+@@ -538,6 +538,12 @@ bool Session::HasCryptographicStateForWelcome() const noexcept
+ bool Session::VerifyWelcomeState(::mlspp::State const& state,
+                                  std::set<std::string> const& recognizedUserIDs) const
+ {
++    if (state.group_id() != groupId_) {
++        DISCORD_LOG(LS_ERROR) << "MLS welcome targets an unexpected group";
++        TRACK_MLS_ERROR("Welcome message group ID mismatch");
++        return false;
++    }
++
+     if (!externalSender_) {
+         DISCORD_LOG(LS_ERROR) << "Cannot verify MLS welcome without an external sender";
+         TRACK_MLS_ERROR("Missing external sender when processing Welcome");

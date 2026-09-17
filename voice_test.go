@@ -289,9 +289,9 @@ func TestVoiceSenderNeverFallsBackAfterDAVEEncryptionError(t *testing.T) {
 		vc.udpConn, vc.cipher, vc.speaking = remote, aead, true
 		vc.dave = testDAVESession(t, "123")
 		if ready {
-			vc.dave.senderNonce = ^uint32(0)
+			vc.dave.Close()
 		} else {
-			vc.dave.active = false
+			vc.dave.Reset()
 		}
 		vc.OpusSend <- []byte("private audio")
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

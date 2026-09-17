@@ -242,7 +242,7 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
 				s.log(LogWarning, "error reading from gateway %s websocket, %s", s.gateway, err)
 				// There has been an error reading, close the websocket so that
 				// OnDisconnect event is emitted.
-				err := s.Close()
+				err := s.closeWithCode(websocket.CloseNormalClosure, !s.ShouldReconnectOnError)
 				if err != nil {
 					s.log(LogWarning, "error closing session connection, %s", err)
 				}
@@ -262,7 +262,7 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
 		default:
 			_, err := s.onEvent(messageType, message)
 			if errors.Is(err, errReconnect) {
-				s.CloseWithCode(websocket.CloseServiceRestart)
+				s.closeWithCode(websocket.CloseServiceRestart, !s.ShouldReconnectOnError)
 				s.reconnect()
 				return
 			}
@@ -321,7 +321,7 @@ func (s *Session) heartbeat(wsConn *websocket.Conn, listening <-chan interface{}
 			} else {
 				s.log(LogError, "haven't gotten a heartbeat ACK in %v, triggering a reconnection", time.Now().UTC().Sub(last))
 			}
-			s.Close()
+			s.closeWithCode(websocket.CloseNormalClosure, !s.ShouldReconnectOnError)
 			s.reconnect()
 			return
 		}
@@ -746,17 +746,18 @@ func (s *Session) ChannelVoiceJoin(ctx context.Context, gID, cID string, mute, d
 	if created {
 		dead := make(chan struct{})
 		voice = &VoiceConnection{
-			Cond:     sync.NewCond(&sync.Mutex{}),
-			Status:   VoiceConnectionStatusNew,
-			Dead:     dead,
-			dead:     dead,
-			GuildID:  gID,
-			session:  s,
-			LogLevel: s.LogLevel,
-			mute:     mute,
-			deaf:     deaf,
-			OpusSend: make(chan []byte, 16),
-			OpusRecv: make(chan *Packet, 2),
+			Cond:      sync.NewCond(&sync.Mutex{}),
+			Status:    VoiceConnectionStatusNew,
+			Dead:      dead,
+			dead:      dead,
+			GuildID:   gID,
+			channelID: cID,
+			session:   s,
+			LogLevel:  s.LogLevel,
+			mute:      mute,
+			deaf:      deaf,
+			OpusSend:  make(chan []byte, 16),
+			OpusRecv:  make(chan *Packet, 2),
 		}
 		s.VoiceConnections[gID] = voice
 	}
@@ -834,6 +835,7 @@ func (s *Session) onVoiceStateUpdate(st *VoiceStateUpdate) {
 		return
 	}
 	voice.sessionID = st.SessionID
+	voice.channelID = st.ChannelID
 	voice.mute = st.Mute || st.SelfMute
 	voice.deaf = st.Deaf || st.SelfDeaf
 	voice.Cond.Broadcast()
@@ -959,16 +961,18 @@ func (s *Session) reconnect() {
 	}
 }
 
-// Close closes a websocket and stops all listening/heartbeat goroutines.
-// TODO: Add support for Voice WS/UDP
+// Close closes the gateway and all voice connections.
 func (s *Session) Close() error {
 	return s.CloseWithCode(websocket.CloseNormalClosure)
 }
 
-// CloseWithCode closes a websocket using the provided closeCode and stops all
-// listening/heartbeat goroutines.
-// TODO: Add support for Voice WS/UDP connections
-func (s *Session) CloseWithCode(closeCode int) (err error) {
+// CloseWithCode closes the gateway with closeCode and all voice connections.
+func (s *Session) CloseWithCode(closeCode int) error {
+	return s.closeWithCode(closeCode, true)
+}
+
+// Gateway reconnects preserve voice transports while the gateway session resumes.
+func (s *Session) closeWithCode(closeCode int, closeVoice bool) (err error) {
 
 	s.log(LogInformational, "called")
 	s.Lock()
@@ -981,8 +985,15 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 		s.listening = nil
 	}
 
-	// TODO: Close all active Voice Connections too
-	// this should force stop any reconnecting voice channels too
+	var voices []*VoiceConnection
+	if closeVoice {
+		for _, voice := range s.VoiceConnections {
+			if voice != nil {
+				voices = append(voices, voice)
+			}
+		}
+		clear(s.VoiceConnections)
+	}
 
 	if s.wsConn != nil {
 
@@ -1009,6 +1020,10 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 	}
 
 	s.Unlock()
+
+	for _, voice := range voices {
+		voice.Kill()
+	}
 
 	s.log(LogInformational, "emit disconnect event")
 	s.handleEvent(disconnectEventType, &Disconnect{})

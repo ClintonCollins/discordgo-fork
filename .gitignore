@@ -3,3 +3,6 @@
 
 # Environment variables. Useful for examples.
 .env
+
+# Local native build dependencies
+/.native/
