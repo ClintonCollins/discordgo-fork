@@ -125,11 +125,11 @@ func (r *tlsReader) readVec() []byte {
 	if r.err != nil {
 		return nil
 	}
-	n := int(length)
-	if r.pos+n > len(r.data) {
-		r.err = fmt.Errorf("tlsReader: short read vec len=%d at pos %d", n, r.pos)
+	if length > uint64(r.remaining()) {
+		r.err = fmt.Errorf("tlsReader: short read vec len=%d at pos %d", length, r.pos)
 		return nil
 	}
+	n := int(length)
 	out := make([]byte, n)
 	copy(out, r.data[r.pos:r.pos+n])
 	r.pos += n

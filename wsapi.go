@@ -38,6 +38,8 @@ var ErrWSNotFound = errors.New("no websocket connection exists")
 // more than the total shard count
 var ErrWSShardBounds = errors.New("ShardID must be less than ShardCount")
 
+var errReconnect = errors.New("reconnect required by gateway")
+
 type resumePacket struct {
 	Op   int `json:"op"`
 	Data struct {
@@ -258,7 +260,12 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
 			return
 
 		default:
-			s.onEvent(messageType, message)
+			_, err := s.onEvent(messageType, message)
+			if errors.Is(err, errReconnect) {
+				s.CloseWithCode(websocket.CloseServiceRestart)
+				s.reconnect()
+				return
+			}
 
 		}
 	}
@@ -278,9 +285,9 @@ const FailedHeartbeatAcks time.Duration = 5 * time.Millisecond
 
 // HeartbeatLatency returns the latency between heartbeat acknowledgement and heartbeat send.
 func (s *Session) HeartbeatLatency() time.Duration {
-
+	s.RLock()
+	defer s.RUnlock()
 	return s.LastHeartbeatAck.Sub(s.LastHeartbeatSent)
-
 }
 
 // heartbeat sends regular heartbeats to Discord so it knows the client
@@ -299,13 +306,13 @@ func (s *Session) heartbeat(wsConn *websocket.Conn, listening <-chan interface{}
 	defer ticker.Stop()
 
 	for {
-		s.RLock()
+		s.Lock()
 		last := s.LastHeartbeatAck
-		s.RUnlock()
+		s.LastHeartbeatSent = time.Now().UTC()
+		s.Unlock()
 		sequence := atomic.LoadInt64(s.sequence)
 		s.log(LogDebug, "sending gateway websocket heartbeat seq %d", sequence)
 		s.wsMutex.Lock()
-		s.LastHeartbeatSent = time.Now().UTC()
 		err = wsConn.WriteJSON(heartbeatOp{1, sequence})
 		s.wsMutex.Unlock()
 		if err != nil || time.Now().UTC().Sub(last) > (heartbeatIntervalMsec*FailedHeartbeatAcks) {
@@ -604,8 +611,16 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	// Must respond with a heartbeat packet within 5 seconds
 	if e.Operation == 1 {
 		s.log(LogInformational, "sending heartbeat in response to Op1")
+
+		s.RLock()
+		wsConn := s.wsConn
+		s.RUnlock()
+		if wsConn == nil {
+			return e, ErrWSNotFound
+		}
+
 		s.wsMutex.Lock()
-		err = s.wsConn.WriteJSON(heartbeatOp{1, atomic.LoadInt64(s.sequence)})
+		err = wsConn.WriteJSON(heartbeatOp{1, atomic.LoadInt64(s.sequence)})
 		s.wsMutex.Unlock()
 		if err != nil {
 			s.log(LogError, "error sending heartbeat in response to Op1")
@@ -618,17 +633,14 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	// Reconnect
 	// Must immediately disconnect from gateway and reconnect to new gateway.
 	if e.Operation == 7 {
-		s.log(LogInformational, "Closing and reconnecting in response to Op7")
-		s.CloseWithCode(websocket.CloseServiceRestart)
-		s.reconnect()
-		return e, nil
+		s.log(LogInformational, "Received Op 7 (Reconnect) from gateway")
+		return e, errReconnect
 	}
 
 	// Invalid Session
 	// Must respond with a Identify packet.
 	if e.Operation == 9 {
-		s.log(LogInformational, "Closing and reconnecting in response to Op9")
-		s.CloseWithCode(websocket.CloseServiceRestart)
+		s.log(LogInformational, "Received Op 9 (Invalid Session) from gateway")
 
 		var resumable bool
 		if err := json.Unmarshal(e.RawData, &resumable); err != nil {
@@ -638,13 +650,10 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 
 		if !resumable {
 			s.log(LogInformational, "Gateway session is not resumable, discarding its information")
-			s.resumeGatewayURL = ""
-			s.sessionID = ""
-			atomic.StoreInt64(s.sequence, 0)
+			s.discardResumeState()
 		}
 
-		s.reconnect()
-		return e, nil
+		return e, errReconnect
 	}
 
 	if e.Operation == 10 {
@@ -721,37 +730,45 @@ type voiceChannelJoinOp struct {
 //	mute    : If true, you will be set to muted upon joining.
 //	deaf    : If true, you will be set to deafened upon joining.
 func (s *Session) ChannelVoiceJoin(ctx context.Context, gID, cID string, mute, deaf bool) (voice *VoiceConnection, err error) {
-
 	s.log(LogInformational, "called")
 
-	s.RLock()
-	voice = s.VoiceConnections[gID]
-	s.RUnlock()
-
-	if voice == nil {
-		voice = &VoiceConnection{}
-		s.Lock()
-		s.VoiceConnections[gID] = voice
-		s.Unlock()
-	}
-
-	voice.Cond = sync.NewCond(&sync.Mutex{})
-	voice.Cond.L.Lock()
-	voice.Status = VoiceConnectionStatusNew
-	voice.dead = make(chan struct{})
-	voice.Dead = voice.dead
-	voice.GuildID = gID
-	voice.session = s
-	voice.LogLevel = s.LogLevel
-	voice.Cond.L.Unlock()
-
-	err = s.VoiceStateUpdate(gID, cID, mute, deaf)
+	err = ctx.Err()
 	if err != nil {
 		return
 	}
 
-	err = voice.waitUntilStatus(ctx, VoiceConnectionStatusReady)
+	s.Lock()
+	if s.VoiceConnections == nil {
+		s.VoiceConnections = make(map[string]*VoiceConnection)
+	}
+	voice = s.VoiceConnections[gID]
+	created := voice == nil
+	if created {
+		dead := make(chan struct{})
+		voice = &VoiceConnection{
+			Cond:     sync.NewCond(&sync.Mutex{}),
+			Status:   VoiceConnectionStatusNew,
+			Dead:     dead,
+			dead:     dead,
+			GuildID:  gID,
+			session:  s,
+			LogLevel: s.LogLevel,
+			mute:     mute,
+			deaf:     deaf,
+			OpusSend: make(chan []byte, 16),
+			OpusRecv: make(chan *Packet, 2),
+		}
+		s.VoiceConnections[gID] = voice
+	}
+	s.Unlock()
 
+	err = s.VoiceStateUpdate(gID, cID, mute, deaf)
+	if err == nil {
+		err = voice.waitUntilStatus(ctx, VoiceConnectionStatusReady)
+	}
+	if err != nil && created {
+		voice.Kill()
+	}
 	return
 }
 
@@ -776,6 +793,13 @@ func (s *Session) VoiceStateUpdate(gID, cID string, mute, deaf bool) (err error)
 
 	// Send the request to Discord that we want to join the voice channel
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, channelID, mute, deaf}}
+
+	s.RLock()
+	defer s.RUnlock()
+	if s.wsConn == nil {
+		return ErrWSNotFound
+	}
+
 	s.wsMutex.Lock()
 	err = s.wsConn.WriteJSON(data)
 	s.wsMutex.Unlock()
@@ -784,31 +808,35 @@ func (s *Session) VoiceStateUpdate(gID, cID string, mute, deaf bool) (err error)
 
 // onVoiceStateUpdate handles Voice State Update events on the data websocket.
 func (s *Session) onVoiceStateUpdate(st *VoiceStateUpdate) {
-
-	// Check if we have a voice connection to update
 	s.RLock()
-	voice, exists := s.VoiceConnections[st.GuildID]
+	voice := s.VoiceConnections[st.GuildID]
+	state := s.State
 	s.RUnlock()
-	if !exists {
+	if voice == nil || state == nil {
 		return
 	}
 
-	// We only care about events that are about us.
-	if s.State.User.ID != st.UserID {
+	state.RLock()
+	self := state.User != nil && state.User.ID == st.UserID
+	state.RUnlock()
+	if !self {
 		return
 	}
 
-	// Store the SessionID for later use.
 	if st.ChannelID == "" {
 		voice.Kill()
-	} else {
-		voice.Cond.L.Lock()
-		defer voice.Cond.L.Unlock()
-		voice.sessionID = st.SessionID
-		voice.mute = st.Mute
-		voice.deaf = st.Deaf
-		voice.Cond.Broadcast()
+		return
 	}
+
+	voice.Cond.L.Lock()
+	defer voice.Cond.L.Unlock()
+	if voice.Status == VoiceConnectionStatusDead {
+		return
+	}
+	voice.sessionID = st.SessionID
+	voice.mute = st.Mute || st.SelfMute
+	voice.deaf = st.Deaf || st.SelfDeaf
+	voice.Cond.Broadcast()
 }
 
 // onVoiceServerUpdate handles the Voice Server Update data websocket event.
@@ -821,11 +849,11 @@ func (s *Session) onVoiceServerUpdate(ev *VoiceServerUpdate) {
 	s.log(LogInformational, "called")
 
 	s.RLock()
-	voice, exists := s.VoiceConnections[ev.GuildID]
+	voice := s.VoiceConnections[ev.GuildID]
 	s.RUnlock()
 
 	// If no VoiceConnection exists, just skip this
-	if !exists {
+	if voice == nil {
 		return
 	}
 
@@ -879,6 +907,14 @@ func (s *Session) identify() error {
 	return err
 }
 
+const maxResumeAttempts = 3
+
+func (s *Session) discardResumeState() {
+	s.resumeGatewayURL = ""
+	s.sessionID = ""
+	atomic.StoreInt64(s.sequence, 0)
+}
+
 func (s *Session) reconnect() {
 
 	s.log(LogInformational, "called")
@@ -888,6 +924,7 @@ func (s *Session) reconnect() {
 	if s.ShouldReconnectOnError {
 
 		wait := time.Duration(1)
+		failures := 0
 
 		for {
 			s.log(LogInformational, "trying to reconnect to gateway")
@@ -906,6 +943,12 @@ func (s *Session) reconnect() {
 			}
 
 			s.log(LogError, "error reconnecting to gateway, %s", err)
+
+			failures++
+			if failures >= maxResumeAttempts && s.sessionID != "" {
+				s.log(LogWarning, "discarding resume information after %d failed reconnects, next attempt will identify", failures)
+				s.discardResumeState()
+			}
 
 			<-time.After(wait * time.Second)
 			wait *= 2

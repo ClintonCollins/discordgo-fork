@@ -13,10 +13,10 @@ import (
 var errNotDAVEFrame = fmt.Errorf("not a DAVE frame")
 
 const (
-	daveTagSize                = 8
-	daveKeySize                = 16
-	daveExportLabel            = "Discord Secure Frames v0"
-	minSupplementalBytesSize   = daveTagSize + 1 + 1 + 2 // tag + nonce(min 1) + sizeB + magic = 12
+	daveTagSize              = 8
+	daveKeySize              = 16
+	daveExportLabel          = "Discord Secure Frames v0"
+	minSupplementalBytesSize = daveTagSize + 1 + 1 + 2 // tag + nonce(min 1) + sizeB + magic = 12
 )
 
 func encryptSecureFrame(frameCipher cipher.AEAD, nonce uint32, opusData []byte) []byte {
@@ -62,19 +62,6 @@ func encodeULEB128(value uint32) []byte {
 	return result
 }
 
-func decodeULEB128(data []byte) (uint32, int) {
-	var result uint32
-	var shift uint
-	for i, b := range data {
-		result |= uint32(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return result, i + 1
-		}
-		shift += 7
-	}
-	return result, len(data)
-}
-
 func parseSecureFrame(data []byte) (ciphertext, truncatedTag []byte, nonce uint32, err error) {
 	if len(data) < 2+1+1+daveTagSize {
 		err = fmt.Errorf("secure frame too short: %d bytes", len(data))
@@ -97,7 +84,12 @@ func parseSecureFrame(data []byte) (ciphertext, truncatedTag []byte, nonce uint3
 	ciphertext = data[:supplementalStart]
 
 	nonceBytes := data[supplementalStart+daveTagSize : len(data)-3]
-	nonce, _ = decodeULEB128(nonceBytes)
+	decodedNonce, n := binary.Uvarint(nonceBytes)
+	if n <= 0 || n != len(nonceBytes) || decodedNonce > uint64(^uint32(0)) {
+		err = fmt.Errorf("invalid secure frame nonce")
+		return
+	}
+	nonce = uint32(decodedNonce)
 
 	truncatedTag = data[supplementalStart : supplementalStart+daveTagSize]
 

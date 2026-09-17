@@ -45,7 +45,7 @@ func TestUserAvatar(t *testing.T) {
 		if err.Error() == `HTTP 404 NOT FOUND, {"code": 0, "message": "404: Not Found"}` {
 			t.Skip("Skipped, @me doesn't have an Avatar")
 		}
-		t.Errorf(err.Error())
+		t.Error(err)
 	}
 
 	if a == nil {
@@ -62,7 +62,7 @@ func TestUserUpdate(t *testing.T) {
 
 	u, err := dg.User("@me")
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err)
 	}
 
 	s, err := dg.UserUpdate(envEmail, envPassword, "testname", u.Avatar, "")
@@ -95,7 +95,7 @@ func TestUserChannelCreate(t *testing.T) {
 
 	_, err := dg.UserChannelCreate(envAdmin)
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err)
 	}
 
 	// TODO make sure the channel was added
@@ -108,7 +108,7 @@ func TestUserGuilds(t *testing.T) {
 
 	_, err := dg.UserGuilds(10, "", "", false)
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err)
 	}
 }
 
