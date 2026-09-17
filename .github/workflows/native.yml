@@ -14,7 +14,7 @@ jobs:
           - platform: linux
             runner: ubuntu-24.04
           - platform: windows
-            runner: windows-2025
+            runner: windows-2022
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
