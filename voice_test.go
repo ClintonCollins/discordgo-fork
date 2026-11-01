@@ -63,7 +63,7 @@ func TestOnEventOP12NotifiesSpeakingHandlers(t *testing.T) {
 		got = append(got, vs)
 	})
 
-	vc.onEvent(context.Background(), false, []byte(`{"op":12,"d":{"user_id":"user-a","audio_ssrc":4242}}`))
+	vc.onEvent(context.Background(), context.Background(), false, []byte(`{"op":12,"d":{"user_id":"user-a","audio_ssrc":4242}}`))
 
 	if len(got) != 1 {
 		t.Fatalf("handlers were called %d times, want 1 for an op12 with an audio SSRC", len(got))
@@ -82,7 +82,7 @@ func TestOnEventOP12WithoutAnSSRCNotifiesNobody(t *testing.T) {
 	called := false
 	vc.AddHandler(func(_ *VoiceConnection, _ *VoiceSpeakingUpdate) { called = true })
 
-	vc.onEvent(context.Background(), false, []byte(`{"op":12,"d":{"user_id":"user-a","audio_ssrc":0}}`))
+	vc.onEvent(context.Background(), context.Background(), false, []byte(`{"op":12,"d":{"user_id":"user-a","audio_ssrc":0}}`))
 
 	if called {
 		t.Error("handlers were called for an op12 carrying no audio SSRC")
@@ -404,7 +404,7 @@ func TestStaleVoiceReadyCannotReplaceTransport(t *testing.T) {
 	done := make(chan struct{})
 	gate.Mutex.Lock()
 	go func() {
-		vc.onEvent(ctx, false, []byte(`{"op":2,"d":{"ssrc":55,"port":1,"ip":"127.0.0.1"}}`))
+		vc.onEvent(ctx, ctx, false, []byte(`{"op":2,"d":{"ssrc":55,"port":1,"ip":"127.0.0.1"}}`))
 		close(done)
 	}()
 	<-gate.entered

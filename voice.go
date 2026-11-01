@@ -420,21 +420,23 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 		default:
 		}
 
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel() // this cancel() is not needed actually, but do it to suppress lint warning
+		wsCtx, closeSocket := context.WithCancel(ctx)
+		defer closeSocket()
 
 		v.Cond.L.Lock()
 		if ctx.Err() != nil || v.Status == VoiceConnectionStatusDead {
 			v.Cond.L.Unlock()
 			return
 		}
-		v.Status = VoiceConnectionStatusConnecting
-		v.Cond.Broadcast()
+		if i == 0 {
+			v.Status = VoiceConnectionStatusConnecting
+			v.Cond.Broadcast()
+		}
 		v.Cond.L.Unlock()
 
 		vg := "wss://" + endpoint + "?v=8"
 		v.log(LogInformational, "connecting to voice endpoint %s", vg)
-		wsConn, _, err := v.session.Dialer.DialContext(ctx, vg, nil)
+		wsConn, _, err := v.session.Dialer.DialContext(wsCtx, vg, nil)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -444,7 +446,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 			return
 		}
 		go func() {
-			<-ctx.Done()
+			<-wsCtx.Done()
 			// don't do graceful closing of websocket because it's not needed
 			err := wsConn.Close()
 			v.log(LogDebug, "closed voice websocket due to context done: %v", err)
@@ -518,14 +520,6 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				v.failure(ctx, err)
 				return
 			}
-
-			// reopen UDP connection because WebSocket broken likely meaning UDP broken too.
-			err = v.udpOpen(ctx)
-			if err != nil {
-				err = fmt.Errorf("failed to resume UDP connection, %w", err)
-				v.failure(ctx, err)
-				return
-			}
 		}
 
 		for {
@@ -575,14 +569,14 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 				v.log(LogInformational, "voice socket disconnected, reconnecting, %v", err)
 
 				// close goroutine related to websocket
-				cancel()
+				closeSocket()
 
 				// reconnect
 				break
 			}
 
 			// Pass received message to voice event handler
-			v.onEvent(ctx, messageType == websocket.BinaryMessage, message)
+			v.onEvent(ctx, wsCtx, messageType == websocket.BinaryMessage, message)
 		}
 	}
 
@@ -591,7 +585,7 @@ func (v *VoiceConnection) websocket(ctx context.Context, endpoint string, token 
 
 // wsEvent handles any voice websocket events. This is only called by the
 // wsListen() function.
-func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []byte) {
+func (v *VoiceConnection) onEvent(ctx, wsCtx context.Context, binary bool, message []byte) {
 	v.eventMu.Lock()
 	defer v.eventMu.Unlock()
 	if ctx.Err() != nil {
@@ -834,7 +828,7 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 			v.Cond.L.Lock()
 			wsConn := v.wsConn
 			v.Cond.L.Unlock()
-			go v.wsHeartbeat(ctx, wsConn, op8.HeartbeatInterval)
+			go v.wsHeartbeat(wsCtx, wsConn, op8.HeartbeatInterval)
 
 		case 9: // resumed
 			v.Cond.L.Lock()
@@ -884,8 +878,8 @@ func (v *VoiceConnection) onEvent(ctx context.Context, binary bool, message []by
 
 }
 
-// startMediaLocked starts one sender/receiver pair per transport. Resume retains
-// its DAVE epoch and transport nonce; only the canceled media workers restart.
+// startMediaLocked starts one sender/receiver pair per transport. Websocket
+// resumes retain the UDP socket, media workers, DAVE epoch, and transport nonce.
 func (v *VoiceConnection) startMediaLocked(ctx context.Context) {
 	if ctx.Err() != nil || v.Status == VoiceConnectionStatusDead || v.mediaCtx == ctx || v.udpConn == nil || v.cipher == nil {
 		return

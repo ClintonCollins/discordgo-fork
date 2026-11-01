@@ -19,7 +19,7 @@ func TestDAVEVoiceRejectsIncompleteTransition(t *testing.T) {
 			vc := lifecycleVoice()
 			defer vc.Kill()
 			vc.dave = testDAVESession(t, "101")
-			vc.onEvent(t.Context(), false, []byte(`{"op":21,"d":`+data+`}`))
+			vc.onEvent(t.Context(), t.Context(), false, []byte(`{"op":21,"d":`+data+`}`))
 			if !vc.dave.CanEncrypt() || vc.dave.canSendPassthrough() {
 				t.Fatal("incomplete transition enabled plaintext sending")
 			}
@@ -94,7 +94,7 @@ func testDAVEVoiceHandshake(t *testing.T, initialVersion int) {
 	vc.session.State.User = &User{ID: "101"}
 	_, remote, _ := voiceUDPPair(t)
 	vc.udpConn = remote
-	vc.onEvent(ctx, false, []byte(`{"op":11,"d":{"user_ids":["202"]}}`))
+	vc.onEvent(ctx, ctx, false, []byte(`{"op":11,"d":{"user_ids":["202"]}}`))
 	op4, err := json.Marshal(struct {
 		Op   int      `json:"op"`
 		Data voiceOP4 `json:"d"`
@@ -102,12 +102,12 @@ func testDAVEVoiceHandshake(t *testing.T, initialVersion int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vc.onEvent(ctx, false, op4)
+	vc.onEvent(ctx, ctx, false, op4)
 	if initialVersion == 0 {
 		if vc.dave == nil || !vc.dave.canSendPassthrough() {
 			t.Fatal("version zero session cannot prepare a later DAVE upgrade")
 		}
-		vc.onEvent(ctx, false, []byte(`{"op":24,"d":{"epoch":1,"protocol_version":1}}`))
+		vc.onEvent(ctx, ctx, false, []byte(`{"op":24,"d":{"epoch":1,"protocol_version":1}}`))
 		if !vc.dave.canSendPassthrough() {
 			t.Fatal("preparing the upgrade changed the sending mode before execute")
 		}
@@ -121,7 +121,7 @@ func testDAVEVoiceHandshake(t *testing.T, initialVersion int) {
 	g.members[0], g.packages[0] = vc.dave, keyPackage
 	incoming := func(opcode byte, data []byte) {
 		t.Helper()
-		vc.onEvent(ctx, true, append([]byte{0, 1, opcode}, data...))
+		vc.onEvent(ctx, ctx, true, append([]byte{0, 1, opcode}, data...))
 	}
 	incoming(25, g.sender.packageBytes(t))
 	incoming(27, g.sender.proposal(t, 0, 1, g.packages[1]))
@@ -139,7 +139,7 @@ func testDAVEVoiceHandshake(t *testing.T, initialVersion int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vc.onEvent(ctx, false, []byte(`{"op":22,"d":{"transition_id":1}}`))
+	vc.onEvent(ctx, ctx, false, []byte(`{"op":22,"d":{"transition_id":1}}`))
 	err = g.members[1].HandleExecuteTransition(1)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func testDAVEVoiceHandshake(t *testing.T, initialVersion int) {
 		t.Fatal(err)
 	}
 	testMLSDecrypt(t, g.members[1], 1, testMLSEncrypt(t, vc.dave))
-	vc.onEvent(ctx, false, []byte(`{"op":13,"d":{"user_id":"202"}}`))
+	vc.onEvent(ctx, ctx, false, []byte(`{"op":13,"d":{"user_id":"202"}}`))
 	vc.dave.SetSSRC(2, "202")
 	_, err = vc.dave.DecryptFrame(2, testMLSEncrypt(t, g.members[1]))
 	if err == nil {
